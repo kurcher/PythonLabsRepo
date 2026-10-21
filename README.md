@@ -465,3 +465,120 @@ per-object блокування коштують ~15 %. Масштабуванн
 *відпускає* GIL (`recv` — системний виклик у C), і решта потоків працює. Межа тут — латентність
 мережі, а не інтерпретатор. Висновок: потоки — для I/O, процеси (або free-threading) — для CPU-роботи
 на чистому Python, а для тисяч одночасних з'єднань — `asyncio` (Lab 6).
+
+---
+
+## Lab 6 — асинхронний краулер
+
+```bash
+findex crawl https://docs.python.org/3/ https://peps.python.org/ https://devguide.python.org/ \
+    https://packaging.python.org/en/latest/ https://typing.python.org/en/latest/ \
+    --scope https://docs.python.org/3/ --scope https://peps.python.org/ --scope https://devguide.python.org/ \
+    --scope https://packaging.python.org/en/latest/ --scope https://typing.python.org/en/latest/ \
+    --max-pages 500 --concurrency 20 --per-host 4 --delay 0.1 --out data/crawl.jsonl --log crawl.log
+findex index data/crawl.jsonl --out build/crawl.bin --positions      # індексація — поза event loop
+findex search build/crawl.bin '"event loop" asyncio'
+uv run python scripts/bench_lab06.py --pages 200 --levels 1 5 20
+```
+
+**Етика й дозвіл.** Краулер ходить лише по документації python.org: `docs.python.org/3/`,
+`peps.python.org`, `devguide.python.org`, `packaging.python.org`, `typing.python.org`. Їхні
+`robots.txt` дозволяють сканування (docs.python.org забороняє лише `/dev`, `/release` і старі версії;
+ReadTheDocs-сайти мають автозгенерований `robots.txt` із дозволом, peps — 404, тобто правил немає).
+Краулер чесно себе називає (`User-Agent: findex-crawler/0.6 (student search-engine project; +https://github.com/kurcher/PythonLabsRepo)`),
+дотримується `robots.txt` (і `Crawl-delay`, якщо він є), тримає ≤ 4 одночасних запити на хост із
+паузою ≥ 0.1 с між ними й зупиняється на бюджеті `--max-pages`.
+
+### Як влаштовано (`src/findex/crawler/`)
+
+* **`fetch.py`** — `async def fetch(client, url, *, timeout=10.0, retries=3)`: `asyncio.timeout`,
+  повтори лише для 429/5xx/таймаутів/помилок транспорту (максимум 3), експоненційний backoff із
+  *full jitter* `uniform(0, 0.5·2^attempt)`. `Retry-After` має пріоритет над backoff (секунди або
+  HTTP-дата, не більше 60 с). Інші 4xx не повторюються. `CancelledError` (це `BaseException`) не
+  ловиться, тож скасування краулу працює. Повертає `FetchResult(url, status, content, elapsed, attempts, …)`.
+* **`robots.py`** — `RobotsCache`: один `robots.txt` на хост, з `asyncio.Lock` на хост, тож 20 воркерів,
+  які одночасно прийшли на новий хост, роблять один запит (тест `test_robots_cache_fetches_once_per_host`).
+  404 означає «правил немає», будь-яка інша помилка — «не заходимо».
+* **`html.py`** — канонікалізація URL (схема/хост у нижньому регістрі, без фрагмента й дефолтного
+  порту, відсортований query, `…/index.html` → `…/`), посилання та текст через `selectolax` (lexbor).
+  `script/style/nav/header/footer/aside` викидаються, береться `<main>` / `[role=main]` / `<article>`.
+* **`crawl.py`** — `async def crawl(seeds, *, max_pages, concurrency, per_host, delay, allowed_domains, scopes) -> AsyncIterator[Page]`:
+  * фронтир — `asyncio.Queue`, множина `seen` (канонічні URL; фінальний URL після редіректу теж
+    додається), тож жодна сторінка не завантажується двічі (тест рахує запити до кожного шляху);
+  * `concurrency` воркерів у `asyncio.TaskGroup`, глобальний `Semaphore(concurrency)` + на кожен хост
+    свій `Semaphore(per_host)` і мінімальна пауза `delay` між стартами запитів;
+  * бюджет `max_pages` резервується *до* запиту (лічильник `reserved`), тож навіть 20 воркерів не
+    завантажать зайвих сторінок; на бюджеті або коли фронтир порожній (`queue.join()`) супервізор
+    скасовує воркерів, а клієнт закривається;
+  * це **async-генератор**: сторінки віддаються через невелику чергу, щойно завантажені. Якщо
+    споживач виходить раніше (`break`), `finally` скасовує супервізора (тест `test_consumer_can_stop_early`).
+* **`findex crawl`** пише кожну сторінку одразу одним JSON-рядком (`{"url","title","text","fetched_at"}`),
+  нічого не буферизуючи. Live-панель `rich` показує pages, pages/s, fetched, in-flight, queue, errors,
+  robots-skipped. Пер-URL лог іде в `crawl.log`. `iter_documents` з Lab 1 читає `.jsonl` (поле `title` +
+  `text`; `DocMeta.path` = `crawl.jsonl#<рядок>`, щоб сніпети знайшли текст).
+* Тести — тільки `httpx.MockTransport`, без мережі (12 штук): канонікалізація, `Retry-After`,
+  повтор 503 → успіх, 429 з `Retry-After: 7` (перевіряється, що пауза саме 7 с), 404 без повторів,
+  таймаут → 4 спроби → помилка, кеш robots, повний обхід мок-сайту (robots-заборона, фільтр `.png`,
+  без `<script>`/`<nav>`, жодного дубля), зупинка на `max_pages`, ранній `break`.
+
+### Event loop не блокується
+
+`findex crawl … --debug` запускає `asyncio.run(..., debug=True)`, який попереджає про кожен callback
+довший за 100 мс. Перший прогін показав **дві реальні проблеми**:
+`Executing <Task … worker() …> took 0.416 seconds` — розбір великих HTML-сторінок (selectolax +
+витяг тексту) йшов прямо в циклі; і `go() … took 0.295 seconds` — створення `httpx.AsyncClient`
+синхронно завантажує сховище сертифікатів Windows в SSL-контекст. Виправлення: `parse_page` викликається
+через `asyncio.to_thread`, і клієнт теж створюється в потоці. Після цього `--debug` не дає **жодного**
+попередження. Індексація повністю поза циклом: краул лише пише JSONL, а `findex index` — окрема команда.
+
+### Бенчмарк
+
+Одні й ті самі 5 сідів, `max_pages = 200`, `--per-host 4 --delay 0.1`, кожен рівень в окремому процесі:
+
+| Concurrency | Pages | Wall (s) | Pages/s | Errors | Peak RSS |
+|---|---|---|---|---|---|
+| 1 (фактично послідовно) | 200 | 46.0 | 4.4 | 0 | 53 MiB |
+| 5 | 200 | 19.4 | 10.3 | 0 | 54 MiB |
+| 20 | 200 | 15.3 | **13.1** | 0 | 56 MiB |
+
+Повний краул для корпусу: 500 сторінок за 43.6 с, 0 помилок → `data/crawl.jsonl` → індекс 500 документів,
+22 834 терми; `findex search build/crawl.bin '"event loop" asyncio'` → PEP 475, «Deprecations», PEP 789.
+
+**Чому 20 корутин в одному потоці виграють, хоча потоки в Lab 5 не вигравали.** Lab 5 — CPU-робота:
+кожен крок токенізації виконує байткод і тримає GIL, тож паралелізму немає. Краулер майже весь час
+*чекає мережу* (~150 мс на запит, з яких CPU — кілька мілісекунд). На `await` корутина віддає керування
+event loop'у, той через `select`/IOCP дивиться, які сокети готові, і відновлює відповідні задачі. Тож
+одночасно «в польоті» 20 запитів, а CPU зайнятий лише розбором відповідей. Потоки, до речі, теж
+прискорили I/O у Lab 5 (3×), але кожен потік — це ~1 МБ стеку й OS-планувальник. Корутина — кілька КБ,
+тому пам'ять тут майже не росте (53 → 56 MiB).
+
+**Що коштують per-host ліміти.** З 5 хостами × 4 одночасні запити × пауза 0.1 с стеля ≈ 5 × 10 =
+50 запитів/с. Але BFS-фронтир більшість часу заповнений посиланнями одного-двох хостів (docs.python.org
+дає сотні посилань на перших же сторінках), тож воркери стоять у черзі на семафор цього хоста. Тому
+5 → 20 дає лише +27 % (10.3 → 13.1 сторінки/с), а не 4×. Без ліміту на хост було б швидше, але це
+означало б 20 паралельних запитів до одного сервера. Саме так виглядає краулер, якого банять, і саме
+тому ліміти лишилися: чужий сервер — не наш бенчмарк.
+
+**Де б заблокувався цикл, якби індексувати inline.** `build_index` на сторінці — це токенізація і
+`Counter` у чистому Python, мілісекунди CPU на кожну сторінку, увесь час під GIL і *в потоці циклу*.
+Поки рахується одна сторінка, жоден із 20 сокетів не обслуговується, і завантаження стає послідовним.
+CPU-роботу під час краулу слід виносити в `asyncio.to_thread` (якщо C-код відпускає GIL, як selectolax)
+або в `ProcessPoolExecutor` через `loop.run_in_executor` (для чистого Python). Простіше й надійніше —
+як тут: краул пише JSONL, а індекс будується окремо (і паралельно, Lab 5).
+
+**Оброблений збій (таймаути, лог).** `findex crawl https://docs.python.org/3/ --max-pages 15 --timeout 0.15`:
+
+```
+01:54:08,182 WARNING https://docs.python.org/3/py-modindex.html -> TimeoutError, retry 1 in 0.28 s
+01:54:08,437 WARNING https://docs.python.org/3/whatsnew/3.15.html -> TimeoutError, retry 1 in 0.23 s
+01:54:08,607 INFO 200 https://docs.python.org/3/py-modindex.html 586ms attempts=2
+01:54:08,833 WARNING https://docs.python.org/3/whatsnew/3.15.html -> TimeoutError, retry 2 in 0.97 s
+01:54:09,969 WARNING https://docs.python.org/3/whatsnew/3.15.html -> TimeoutError, retry 3 in 0.48 s
+01:54:10,568 INFO 200 https://docs.python.org/3/whatsnew/3.15.html 2293ms attempts=4
+```
+
+Велика сторінка «What's New» тричі не встигла за 0.15 с. Паузи між спробами — випадкові в межах
+`0.5·2^n` (0.23 → 0.97 → 0.48 с: jitter не дає всім воркерам повторювати синхронно), і четверта спроба
+пройшла. Воркер увесь цей час чекав на `asyncio.sleep` і не блокував решту: інші сторінки (`py-modindex`)
+у ці ж секунди завантажилися. 429 і `Retry-After` перевірені тестом на `MockTransport`, бо python.org
+ні разу не відповів 429 на нашій швидкості.

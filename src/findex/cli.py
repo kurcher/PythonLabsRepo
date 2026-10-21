@@ -26,6 +26,7 @@ from rich.table import Table
 
 from findex import store
 from findex.corpus import Document, iter_documents
+from findex.crawler import CrawlStats
 from findex.index import Index, build_index
 from findex.memory import utf8_stdout
 from findex.parallel import ExecutorName, build_parallel, corpus_paths
@@ -197,3 +198,90 @@ def stats(
             terms.add_row(str(rank), escape(term), f"{count:,}", f"{ix.df(term):,}")
         out.print(terms)
 
+
+def _crawl_panel(stats: CrawlStats, max_pages: int) -> Table:
+    grid = Table.grid(padding=(0, 2))
+    grid.add_row("pages", f"[bold]{stats.pages}[/] / {max_pages}")
+    grid.add_row("pages/s", f"{stats.pages_per_s:.1f}")
+    grid.add_row("fetched", str(stats.fetched))
+    grid.add_row("in flight", str(stats.in_flight))
+    grid.add_row("queue", str(stats.queued))
+    grid.add_row("errors", f"[red]{stats.errors}[/]" if stats.errors else "0")
+    grid.add_row("robots-skipped", str(stats.skipped_robots))
+    return grid
+
+
+@app.command()
+def crawl(
+    seeds: Annotated[list[str], typer.Argument(help="start URL(s)")],
+    max_pages: Annotated[int, typer.Option(min=1)] = 500,
+    concurrency: Annotated[int, typer.Option(min=1, max=100)] = 10,
+    per_host: Annotated[int, typer.Option(min=1, help="max parallel requests per host")] = 2,
+    delay: Annotated[
+        float, typer.Option(min=0.0, help="min seconds between requests per host")
+    ] = 0.25,
+    domain: Annotated[
+        list[str] | None, typer.Option(help="allowed domain (repeatable); default: seed hosts")
+    ] = None,
+    scope: Annotated[
+        list[str] | None, typer.Option(help="only follow URLs with this prefix (repeatable)")
+    ] = None,
+    out_path: Annotated[Path, typer.Option("--out", "-o")] = Path("data/crawl.jsonl"),
+    log_path: Annotated[Path, typer.Option("--log")] = Path("crawl.log"),
+    timeout: Annotated[float, typer.Option(min=0.01, help="per-request timeout, seconds")] = 10.0,
+    debug: Annotated[bool, typer.Option(help="asyncio debug mode: report blocking calls")] = False,
+) -> None:
+    """Crawl politely (robots.txt, per-host limits) and stream pages to JSON lines."""
+    import asyncio
+
+    from rich.live import Live
+
+    from findex.crawler import CrawlStats
+    from findex.crawler import crawl as run_crawl
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    crawl_log = logging.getLogger("findex.crawl")
+    crawl_log.addHandler(handler)
+    crawl_log.setLevel(logging.INFO)
+    crawl_log.propagate = log.getEffectiveLevel() <= logging.INFO  # -v also shows it on stderr
+    stats = CrawlStats()
+
+    async def go() -> None:
+        with (
+            out_path.open("w", encoding="utf-8") as fh,
+            Live(
+                _crawl_panel(stats, max_pages), console=err, refresh_per_second=4, transient=False
+            ) as live,
+        ):
+            async for page in run_crawl(
+                seeds,
+                max_pages=max_pages,
+                concurrency=concurrency,
+                per_host=per_host,
+                delay=delay,
+                allowed_domains=domain or None,
+                scopes=scope or (),
+                timeout=timeout,
+                stats=stats,
+            ):
+                # one line per page, written as it arrives; indexing happens later,
+                # outside the event loop (`findex index data/crawl.jsonl`)
+                fh.write(json.dumps(page.to_json(), ensure_ascii=False) + "\n")
+                live.update(_crawl_panel(stats, max_pages))
+            live.update(_crawl_panel(stats, max_pages))
+
+    t0 = time.perf_counter()
+    try:
+        asyncio.run(go(), debug=debug)
+    except KeyboardInterrupt:
+        err.print("[yellow]interrupted[/] — pages so far are saved")
+    finally:
+        crawl_log.removeHandler(handler)
+        handler.close()
+    err.print()
+    err.print(
+        f"crawled {stats.pages} pages ({stats.errors} errors) in {time.perf_counter() - t0:.1f} s"
+        f" → {out_path}; per-URL log in {log_path}"
+    )
