@@ -76,3 +76,8 @@ def test_digits():
         "an",
         "mp3",
     ]
+
+
+def test_lone_apostrophes_are_not_tokens():
+    # regression: U+02BC is a Unicode letter (Lm); Hypothesis found "ʼ" -> ["'"]
+    assert toks("ʼ ' ’ ʼсловоʼ") == ["слово"]

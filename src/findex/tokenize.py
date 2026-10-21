@@ -25,7 +25,10 @@ from collections.abc import Iterator
 
 _MARKS = "\u0300-\u036f"  # combining diacritical marks
 _APOS = "'\u2019\u02bc"  # ASCII apostrophe, right single quote, modifier letter apostrophe
-_WORD = rf"[^\W_](?:[^\W_]|[{_MARKS}])*"
+# U+02BC is Unicode category Lm (a *letter*), so \w matches it: exclude it from word
+# characters, otherwise a lone "ʼ" would become the token "'" (found by Hypothesis).
+_LETTER = r"[^\W_\u02bc]"
+_WORD = rf"{_LETTER}(?:{_LETTER}|[{_MARKS}])*"
 WORD_RE = re.compile(rf"{_WORD}(?:[{_APOS}]{_WORD})*")
 _MARKS_RE = re.compile(f"[{_MARKS}]")
 _APOS_TABLE = str.maketrans({"\u2019": "'", "\u02bc": "'"})
