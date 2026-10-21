@@ -1,0 +1,29 @@
+{% if error %}
+  <p class="error">{{ error }}</p>
+{% elif result %}
+  <p class="meta">{{ "{:,}".format(result.total) }} results · {{ result.took_ms }} ms · {{ result.scorer|upper }}
+    {% if result.pages > 1 %}· page {{ result.page }} of {{ result.pages }}{% endif %}</p>
+  {% if not result.results %}
+    <p class="empty">Nothing matched. Try fewer words, or <code>OR</code> between them.</p>
+  {% endif %}
+  <ol class="hits" start="{{ (result.page - 1) * result.k + 1 }}">
+  {% for hit in result.results %}
+    <li class="hit">
+      <a class="title" href="/doc/{{ hit.doc_id }}?q={{ q|urlencode }}">{{ hit.title }}</a>
+      <p class="snippet">{{ hit.snippet_html|safe }}</p>
+      <span class="score">score {{ "%.3f"|format(hit.score) }} · doc {{ hit.doc_id }}</span>
+    </li>
+  {% endfor %}
+  </ol>
+  {% if result.pages > 1 %}
+  <nav class="pager" aria-label="Pages">
+    {% if result.page > 1 %}
+      <a href="/?q={{ q|urlencode }}&scorer={{ scorer }}&k={{ k }}&page={{ result.page - 1 }}">← Previous</a>
+    {% endif %}
+    <span>{{ result.page }} / {{ result.pages }}</span>
+    {% if result.page < result.pages %}
+      <a href="/?q={{ q|urlencode }}&scorer={{ scorer }}&k={{ k }}&page={{ result.page + 1 }}">Next →</a>
+    {% endif %}
+  </nav>
+  {% endif %}
+{% endif %}

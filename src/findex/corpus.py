@@ -15,6 +15,7 @@ from __future__ import annotations
 import gzip
 import json
 import logging
+import os
 from collections.abc import Iterator
 from pathlib import Path
 from typing import IO, NamedTuple
@@ -34,7 +35,9 @@ class Document(NamedTuple):
     @property
     def locator(self) -> str:
         """Where to find this document again: ``path`` or ``path#line``."""
-        return f"{self.path}#{self.line}" if self.line else str(self.path)
+        # POSIX separators so an index built on Windows still resolves inside a Linux container
+        path = self.path.as_posix()
+        return f"{path}#{self.line}" if self.line else path
 
 
 def _open_text(path: Path) -> IO[str]:
@@ -95,6 +98,8 @@ def _join_title(title: str | None, text: str) -> str:
 def read_document(locator: object) -> str:
     """Re-read one document's text from a ``Document.locator`` string (or a ``DocMeta``)."""
     loc = str(getattr(locator, "path", locator))
+    if os.sep == "/":
+        loc = loc.replace("\\", "/")  # indexes built on Windows before locators were POSIX
     path_str, _, line = loc.rpartition("#") if "#" in loc else (loc, "", "")
     path = Path(path_str)
     if not line:

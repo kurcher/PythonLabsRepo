@@ -285,3 +285,29 @@ def crawl(
         f"crawled {stats.pages} pages ({stats.errors} errors) in {time.perf_counter() - t0:.1f} s"
         f" → {out_path}; per-URL log in {log_path}"
     )
+
+
+@app.command()
+def serve(
+    index_path: Annotated[
+        Path | None, typer.Option("--index", help="index file (default: $INDEX_PATH)")
+    ] = None,
+    host: Annotated[str, typer.Option()] = "127.0.0.1",
+    port: Annotated[int, typer.Option(min=1, max=65535)] = 8000,
+    workers: Annotated[int, typer.Option(min=1, help="uvicorn worker processes")] = 1,
+    reload: Annotated[bool, typer.Option(help="auto-reload on code changes (dev)")] = False,
+) -> None:
+    """Run the web UI + JSON API (uvicorn)."""
+    import uvicorn
+
+    if index_path is not None:
+        os.environ["INDEX_PATH"] = str(index_path)  # read by pydantic-settings in each worker
+    uvicorn.run(
+        "findex.web.app:create_app",
+        factory=True,
+        host=host,
+        port=port,
+        workers=workers,
+        reload=reload,
+        log_level="info",
+    )

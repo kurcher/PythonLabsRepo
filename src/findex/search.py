@@ -154,6 +154,7 @@ def search(
     scorer: Scorer | None = None,
     k: int = 10,
     *,
+    offset: int = 0,
     snippets: bool = True,
 ) -> list[SearchResult]:
     """Ranked search: the query tree picks the matching set, ``scorer`` orders it.
@@ -173,7 +174,8 @@ def search(
                 scores[posting.doc_id] += scorer(term, posting, index)
     for doc_id in matched:  # matched only through OR/NOT branches with no scored term
         scores.setdefault(doc_id, 0.0)
-    top = heapq.nlargest(k, scores.items(), key=itemgetter(1))
+    # page n needs the top offset+k; O(n log(offset+k)) is still far below a full sort
+    top = heapq.nlargest(offset + k, scores.items(), key=itemgetter(1))[offset:]
     return [
         SearchResult(
             score,

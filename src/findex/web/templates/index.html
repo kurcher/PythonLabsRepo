@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}{% if q %}{{ q }} — {% endif %}{{ app_name }}{% endblock %}
+{% block content %}
+<form class="search" action="/" method="get" role="search">
+  <input type="search" name="q" value="{{ q }}" placeholder='Search {{ "{:,}".format(docs) }} documents — try: white whale, "call me ishmael", ghost NOT christmas'
+         autofocus autocomplete="off" aria-label="Search query"
+         hx-get="/" hx-trigger="input changed delay:300ms, search" hx-target="#results"
+         hx-include="closest form" hx-push-url="true">
+  <select name="scorer" aria-label="Ranking" hx-get="/" hx-target="#results" hx-include="closest form">
+    <option value="bm25" {% if scorer == "bm25" %}selected{% endif %}>BM25</option>
+    <option value="tfidf" {% if scorer == "tfidf" %}selected{% endif %}>TF-IDF</option>
+  </select>
+  <input type="hidden" name="k" value="{{ k }}">
+  <button type="submit">Search</button>
+</form>
+<p class="hint">AND is implicit · <code>OR</code> · <code>NOT</code> · <code>( )</code> · <code>"exact phrase"</code></p>
+<section id="results">
+  {% include "_results.html" %}
+</section>
+{% endblock %}

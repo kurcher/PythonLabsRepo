@@ -1,0 +1,16 @@
+# Render Blueprint: New → Blueprint → pick this repo. Render builds the Dockerfile
+# (which bakes a 20-book demo index into the image) and routes traffic only while
+# /health returns 200.
+services:
+  - type: web
+    name: findex
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: LOG_LEVEL
+        value: INFO
+      - key: APP_NAME
+        value: findex

@@ -1,0 +1,13 @@
+.git
+.venv
+.github
+data
+build
+dist
+docs
+tests
+**/__pycache__
+.pytest_cache
+.hypothesis
+.coverage
+*.log

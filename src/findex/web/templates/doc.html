@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} — {{ app_name }}{% endblock %}
+{% block content %}
+<p class="back"><a href="/?q={{ q|urlencode }}">← back to results</a></p>
+<article class="doc">
+  <h1>{{ title }}</h1>
+  <p class="meta">doc {{ doc_id }} · {{ "{:,}".format(length) }} tokens{% if q %} · matches for <q>{{ q }}</q> highlighted{% endif %}</p>
+  <div class="body">{{ body|safe }}</div>
+</article>
+{% endblock %}

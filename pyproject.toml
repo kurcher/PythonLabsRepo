@@ -1,6 +1,6 @@
 [project]
 name = "findex"
-version = "0.4.0"
+version = "0.7.0"
 description = "A full-text search engine over a corpus you choose"
 readme = "README.md"
 license = "MIT"
@@ -15,10 +15,14 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "fastapi>=0.159.1",
     "httpx>=0.28.1",
+    "jinja2>=3.1.6",
+    "pydantic-settings>=2.16.1",
     "rich>=15.0.0",
     "selectolax>=1.0.1",
     "typer>=0.27.3",
+    "uvicorn[standard]>=0.54.0",
 ]
 
 [project.scripts]
@@ -33,6 +37,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "httpx2>=2.16.0",
     "hypothesis>=6.170.5",
     "matplotlib>=3.11.2",
     "pyright>=1.1.414",
@@ -60,6 +65,7 @@ pythonVersion = "3.13"
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 markers = ["slow: takes more than a second"]
+filterwarnings = ["ignore:Using `httpx` with `starlette.testclient` is deprecated:DeprecationWarning"]
 
 [tool.coverage.run]
 source = ["findex"]
