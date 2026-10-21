@@ -6,16 +6,20 @@ python -m findex.index data/ --out index.bin [--positions] [--format binary|pick
 from __future__ import annotations
 
 import argparse
+import functools
 import time
 from array import array
 from collections import Counter, defaultdict
-from collections.abc import Iterable
-from dataclasses import dataclass, field
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
+from functools import cached_property
 from itertools import islice
 from pathlib import Path
 from typing import Literal
 
 from findex.corpus import Document, iter_documents
+from findex.decorators import timed
 from findex.memory import peak_rss, utf8_stdout
 from findex.tokenize import tokenize
 
@@ -46,16 +50,113 @@ class PlainPosting:
 PostingsRepr = Literal["slots", "plain", "array"]
 
 
-@dataclass
-class InvertedIndex:
-    postings: dict[str, list[Posting]] = field(default_factory=dict)
-    doc_lengths: dict[int, int] = field(default_factory=dict)
-    doc_meta: dict[int, DocMeta] = field(default_factory=dict)
-    has_positions: bool = False
+class Index(Mapping[str, list[Posting]]):
+    """Read-only mapping ``term -> postings`` plus the per-document statistics ranking needs.
 
+    Inheriting ``Mapping`` turns the five methods below into ``get``, ``keys``, ``items``,
+    ``values`` and ``==`` for free.
+    """
+
+    def __init__(
+        self,
+        postings: dict[str, list[Posting]] | None = None,
+        doc_lengths: dict[int, int] | None = None,
+        doc_meta: dict[int, DocMeta] | None = None,
+        *,
+        has_positions: bool = False,
+    ) -> None:
+        self.postings: dict[str, list[Posting]] = postings if postings is not None else {}
+        self.doc_lengths: dict[int, int] = doc_lengths if doc_lengths is not None else {}
+        self.doc_meta: dict[int, DocMeta] = doc_meta if doc_meta is not None else {}
+        self.has_positions = has_positions
+        self._init_cache()
+
+    # --- the mapping protocol -------------------------------------------------
+    def __getitem__(self, term: str) -> list[Posting]:
+        return self.postings[term]  # KeyError for an unknown term, as a Mapping must
+
+    def __len__(self) -> int:
+        return len(self.postings)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.postings)
+
+    def __contains__(self, term: object) -> bool:
+        return term in self.postings  # one dict lookup instead of Mapping's try/__getitem__
+
+    def __repr__(self) -> str:
+        pos = ", positions" if self.has_positions else ""
+        return f"<Index {len(self):,} terms, {self.num_docs:,} docs{pos}>"
+
+    # --- statistics -----------------------------------------------------------
     @property
     def num_docs(self) -> int:
         return len(self.doc_meta)
+
+    @property
+    def doc_ids(self) -> Iterable[int]:
+        return self.doc_meta.keys()
+
+    @cached_property
+    def avg_doc_length(self) -> float:
+        return sum(self.doc_lengths.values()) / max(1, len(self.doc_lengths))
+
+    def doc_length(self, doc_id: int) -> int:
+        return self.doc_lengths[doc_id]
+
+    def df(self, term: str) -> int:
+        return len(self.postings.get(term, ()))
+
+    def title(self, doc_id: int) -> str:
+        return self.doc_meta[doc_id].title
+
+    def text(self, doc_id: int) -> str:
+        """Full text of a document, re-read from the corpus (the index stores no text)."""
+        from findex.corpus import read_document
+
+        return read_document(self.doc_meta[doc_id])
+
+    # --- cached query matching (Lab 3, M4) -------------------------------------
+    def _init_cache(self) -> None:
+        # A per-instance lru_cache: the Index itself is unhashable (Mapping sets
+        # __hash__ = None), so it cannot be an argument of a module-level cached function.
+        self.matching = functools.lru_cache(maxsize=256)(self._matching)
+
+    def _matching(self, query: str) -> frozenset[int]:
+        from findex.query import parse
+
+        return parse(query).evaluate(self)
+
+    def __getstate__(self) -> dict[str, object]:
+        state = self.__dict__.copy()
+        state.pop("matching", None)  # an lru_cache wrapper doesn't pickle
+        state.pop("avg_doc_length", None)
+        return state
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        self.__dict__.update(state)
+        self._init_cache()
+
+    def close(self) -> None:
+        """Drop the big structures; the object is unusable afterwards."""
+        self.matching.cache_clear()
+        self.postings = {}
+        self.doc_lengths = {}
+        self.doc_meta = {}
+        self.__dict__.pop("avg_doc_length", None)
+
+
+@contextmanager
+def open_index(path: Path) -> Iterator[Index]:
+    """``with open_index(p) as ix:`` — everything before ``yield`` is ``__enter__``,
+    the ``finally`` is ``__exit__`` and runs even if the body raises."""
+    from findex import store
+
+    index = store.load(path)
+    try:
+        yield index
+    finally:
+        index.close()
 
 
 def title_of(doc: Document) -> str:
@@ -77,14 +178,15 @@ def doc_terms(text: str, positions: bool) -> tuple[dict[str, list[int]] | Counte
     return where, n + 1
 
 
-def build_index(docs: Iterable[Document], *, positions: bool = False) -> InvertedIndex:
+@timed
+def build_index(docs: Iterable[Document], *, positions: bool = False) -> Index:
     """One streaming pass: flush each document's Counter into the postings, then drop it.
 
     Documents arrive in increasing ``doc_id`` order, so appending keeps every
     postings list sorted without a separate sort.
     """
     postings: defaultdict[str, list[Posting]] = defaultdict(list)
-    index = InvertedIndex(has_positions=positions)
+    index = Index(has_positions=positions)
     for doc in docs:
         terms, length = doc_terms(doc.text, positions)
         for term, value in terms.items():
@@ -93,7 +195,7 @@ def build_index(docs: Iterable[Document], *, positions: bool = False) -> Inverte
             else:
                 postings[term].append(Posting(doc.doc_id, len(value), tuple(value)))
         index.doc_lengths[doc.doc_id] = length
-        index.doc_meta[doc.doc_id] = DocMeta(doc.doc_id, str(doc.path), title_of(doc))
+        index.doc_meta[doc.doc_id] = DocMeta(doc.doc_id, doc.locator, title_of(doc))
     index.postings = dict(postings)
     return index
 

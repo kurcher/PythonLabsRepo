@@ -1,4 +1,4 @@
-"""Saving and loading an ``InvertedIndex`` in three formats.
+"""Saving and loading an ``Index`` in three formats.
 
 * ``pickle`` — one call each way, fast, and **never safe on an untrusted file**:
   unpickling can call any importable callable (``__reduce__`` → ``os.system``),
@@ -18,7 +18,8 @@ from array import array
 from pathlib import Path
 from typing import Literal
 
-from findex.index import DocMeta, InvertedIndex, Posting
+from findex.decorators import timed
+from findex.index import DocMeta, Index, Posting
 
 Format = Literal["binary", "pickle", "json"]
 FORMATS: tuple[Format, ...] = ("binary", "pickle", "json")
@@ -35,7 +36,7 @@ def detect_format(path: Path) -> Format:
     return "pickle"
 
 
-def save(index: InvertedIndex, path: Path, fmt: Format = "binary") -> None:
+def save(index: Index, path: Path, fmt: Format = "binary") -> None:
     if fmt == "pickle":
         with path.open("wb") as fh:
             pickle.dump(index, fh, protocol=pickle.HIGHEST_PROTOCOL)
@@ -45,34 +46,35 @@ def save(index: InvertedIndex, path: Path, fmt: Format = "binary") -> None:
         _save_binary(index, path)
 
 
-def load(path: Path, fmt: Format | None = None) -> InvertedIndex:
+@timed
+def load(path: Path, fmt: Format | None = None) -> Index:
     fmt = fmt or detect_format(path)
     if fmt == "pickle":
         # Only ever load index files you built yourself — see the module docstring.
         with path.open("rb") as fh:
             index = pickle.load(fh)
-        if not isinstance(index, InvertedIndex):
-            raise TypeError(f"{path} does not contain an InvertedIndex")
+        if not isinstance(index, Index):
+            raise TypeError(f"{path} does not contain an Index")
         return index
     if fmt == "json":
         return _load_json(path)
     return _load_binary(path)
 
 
-def _docs_header(index: InvertedIndex) -> list[list[object]]:
+def _docs_header(index: Index) -> list[list[object]]:
     return [
         [m.doc_id, m.path, m.title, index.doc_lengths[m.doc_id]] for m in index.doc_meta.values()
     ]
 
 
-def _apply_docs_header(index: InvertedIndex, docs: list[list[object]]) -> None:
+def _apply_docs_header(index: Index, docs: list[list[object]]) -> None:
     for doc_id, doc_path, title, length in docs:
         assert isinstance(doc_id, int) and isinstance(length, int)
         index.doc_meta[doc_id] = DocMeta(doc_id, str(doc_path), str(title))
         index.doc_lengths[doc_id] = length
 
 
-def _save_json(index: InvertedIndex, path: Path) -> None:
+def _save_json(index: Index, path: Path) -> None:
     data = {
         "positions": index.has_positions,
         "docs": _docs_header(index),
@@ -88,10 +90,10 @@ def _save_json(index: InvertedIndex, path: Path) -> None:
         json.dump(data, fh, ensure_ascii=False, separators=(",", ":"))
 
 
-def _load_json(path: Path) -> InvertedIndex:
+def _load_json(path: Path) -> Index:
     with path.open(encoding="utf-8") as fh:
         data = json.load(fh)
-    index = InvertedIndex(has_positions=data["positions"])
+    index = Index(has_positions=data["positions"])
     _apply_docs_header(index, data["docs"])
     if index.has_positions:
         index.postings = {
@@ -105,7 +107,7 @@ def _load_json(path: Path) -> InvertedIndex:
     return index
 
 
-def _save_binary(index: InvertedIndex, path: Path) -> None:
+def _save_binary(index: Index, path: Path) -> None:
     blob = array("I")
     terms: dict[str, list[int]] = {}
     for term, plist in index.postings.items():
@@ -135,7 +137,7 @@ def _save_binary(index: InvertedIndex, path: Path) -> None:
         blob.tofile(fh)
 
 
-def _load_binary(path: Path) -> InvertedIndex:
+def _load_binary(path: Path) -> Index:
     with path.open("rb") as fh:
         if fh.read(len(MAGIC)) != MAGIC:
             raise ValueError(f"{path} is not a findex binary index")
@@ -145,7 +147,7 @@ def _load_binary(path: Path) -> InvertedIndex:
     if header["byteorder"] != sys.byteorder:
         blob.byteswap()
 
-    index = InvertedIndex(has_positions=header["positions"])
+    index = Index(has_positions=header["positions"])
     _apply_docs_header(index, header["docs"])
     postings: dict[str, list[Posting]] = {}
     for term, (offset, count, npos) in header["terms"].items():

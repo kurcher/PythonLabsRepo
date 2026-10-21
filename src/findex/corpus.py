@@ -29,6 +29,12 @@ class Document(NamedTuple):
     doc_id: int
     path: Path
     text: str
+    line: int = 0  # 1-based line number inside a JSON-lines file; 0 for one-file documents
+
+    @property
+    def locator(self) -> str:
+        """Where to find this document again: ``path`` or ``path#line``."""
+        return f"{self.path}#{self.line}" if self.line else str(self.path)
 
 
 def _open_text(path: Path) -> IO[str]:
@@ -47,8 +53,8 @@ def iter_paths(root: Path) -> Iterator[Path]:
             yield path
 
 
-def iter_file(path: Path) -> Iterator[tuple[Path, str]]:
-    """Yield ``(path, text)`` for every document stored in one corpus file.
+def iter_file(path: Path) -> Iterator[tuple[Path, str, int]]:
+    """Yield ``(path, text, line)`` for every document stored in one corpus file.
 
     A file that is not valid UTF-8 is logged and skipped, never fatal.
     """
@@ -65,10 +71,10 @@ def iter_file(path: Path) -> Iterator[tuple[Path, str]]:
                         continue
                     text = record.get("text", "")
                     title = record.get("title")
-                    yield path, f"{title}\n\n{text}" if title else text
+                    yield path, _join_title(title, text), lineno
         else:
             with _open_text(path) as fh:
-                yield path, fh.read()
+                yield path, fh.read(), 0
     except (UnicodeDecodeError, OSError) as exc:
         log.warning("skipping %s: %s", path, exc)
 
@@ -77,6 +83,26 @@ def iter_documents(root: Path) -> Iterator[Document]:
     """Stream documents from ``root``; ``doc_id`` is assigned in reading order."""
     doc_id = 0
     for path in iter_paths(root):
-        for doc_path, text in iter_file(path):
-            yield Document(doc_id, doc_path, text)
+        for doc_path, text, line in iter_file(path):
+            yield Document(doc_id, doc_path, text, line)
             doc_id += 1
+
+
+def _join_title(title: str | None, text: str) -> str:
+    return f"{title}\n\n{text}" if title else text
+
+
+def read_document(locator: object) -> str:
+    """Re-read one document's text from a ``Document.locator`` string (or a ``DocMeta``)."""
+    loc = str(getattr(locator, "path", locator))
+    path_str, _, line = loc.rpartition("#") if "#" in loc else (loc, "", "")
+    path = Path(path_str)
+    if not line:
+        with _open_text(path) as fh:
+            return fh.read()
+    with _open_text(path) as fh:
+        for lineno, raw in enumerate(fh, 1):
+            if lineno == int(line):
+                record = json.loads(raw)
+                return _join_title(record.get("title"), record.get("text", ""))
+    raise KeyError(loc)

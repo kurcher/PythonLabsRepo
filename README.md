@@ -190,3 +190,95 @@ pickle-опкоди. (У Lab 8 постинги стануть NumPy-масив�
 а set-варіант усе одно хешує всі 5 038 елементів довгого (86 мкс). На рідкісних термах різниці
 немає — домінує накладна ціна виклику. Висновок: сортовані списки + merge — правильна структура
 для диска й для асиметричних запитів; `set` — коли обидва списки довгі й уже в пам'яті.
+
+---
+
+## Lab 3 — ранжування та об'єктна модель
+
+```bash
+uv run python -m findex.search build/index-pos.bin 'white whale' '"call me ishmael"' 'white whale' -k 3 -v
+uv run python -m findex.search build/index.bin 'whale NOT ship' --scorer tfidf
+uv run python scripts/eval_lab03.py build/index-pos.bin
+```
+
+* **`Index(Mapping[str, list[Posting]])`** (`findex/index.py`): `__getitem__` (KeyError для
+  невідомого терму), `__len__` (кількість термів), `__iter__`, `__contains__`, `__repr__` →
+  `<Index 246,809 terms, 5,229 docs, positions>`; `num_docs`, `avg_doc_length` (`cached_property`),
+  `doc_length()`, `df()`, `title()`, `text()`. `Mapping` безкоштовно дає `get/keys/items/values/==`.
+  `open_index(path)` — `@contextmanager`; `finally` викликає `index.close()` навіть при винятку
+  (тест `test_open_index_releases_on_exception`).
+* **`Scorer`** (`findex/scoring.py`) — `typing.Protocol` з `__call__(term, posting, index) -> float`;
+  `TfIdf` = `(1 + log tf) · log(N/df)` і `BM25(k1=1.5, b=0.75)` — frozen dataclasses з `__call__`.
+  `search(index, query, scorer=BM25(), k=10)` накопичує `score[doc_id]` по постингах позитивних
+  термів запиту та бере топ-k через `heapq.nlargest` (O(n log k)). Результат — `SearchResult(score,
+  doc_id, title, snippet)` з `order=True`; `score` стоїть першим полем, тож `sorted(results, reverse=True)`
+  — це ранжування (`title`/`snippet` мають `compare=False`).
+* **Мова запитів** (`findex/query.py`) — рекурсивний спуск: `or_expr → and_expr ('OR' and_expr)*`,
+  `and_expr → not_expr ('AND'? not_expr)*`, `not_expr → 'NOT' not_expr | atom`,
+  `atom → слово | "фраза" | '(' or_expr ')'`. Вузли `Term/Phrase/And/Or/Not` — frozen dataclasses,
+  перевантажують `&`, `|`, `~`, мають `evaluate(index) -> frozenset[int]`. `And(x, Not(y))`
+  обчислюється як різниця без матеріалізації «всі документи мінус y». Фрази — через позиції:
+  документ підходить, якщо існує `p` з `p+i` у позиціях i-го слова. Тести порівнюють *дерева*:
+  `parse("a OR b c") == Or(Term("a"), And(Term("b"), Term("c")))`.
+* **`@timed`** (`findex/decorators.py`, з `functools.wraps`, PEP 695 `[**P, R]`) на `build_index`,
+  `store.load`, `search` — пише `INFO findex.timing: search took 39.11 ms` у лог (`-v`).
+* **`lru_cache(maxsize=256)`** на шляху «рядок запиту → множина doc_id» (`Index.matching`). Він
+  пер-інстансний, бо `Index` нехешований (`Mapping` ставить `__hash__ = None`), тож його не можна
+  передати в модульну кешовану функцію. Видно в лозі на повторному запиті:
+  ```
+  DEBUG matching cache: CacheInfo(hits=0, misses=1, ...)   # 'white whale'      — 39.1 ms
+  DEBUG matching cache: CacheInfo(hits=0, misses=2, ...)   # '"call me ishmael"'
+  DEBUG matching cache: CacheInfo(hits=1, misses=2, ...)   # 'white whale' знов — 28.9 ms
+  ```
+  (решта часу — скоринг і читання файлів для сніпетів).
+* **Сніпети** (`findex/snippets.py`): вікно ~160 символів з найбільшою кількістю *різних* термів
+  запиту, межі вирівняні по словах, збіги підсвічені (`**…**`, ANSI у терміналі, `<mark>` для веба в Lab 7).
+  Пошук збігів іде по NFC-тексту без casefold, тож регістр оригіналу зберігається:
+  ```
+  1.  10.334  [3413] Moby Dick; Or, The Whale by Herman Melville — CHAPTER 41. Moby Dick.
+       …intervals only, the unaccompanied, secluded **White** **Whale** had haunted those uncivilized seas…
+  ```
+
+### Три перевірки ранжування на корпусі
+
+(N = 5 229, середня довжина документа 3 349 токенів.)
+
+1. **Рідкісний терм важить більше.** `harpoon` (df = 39) з tf = 1 дає BM25 **6.55** (TF-IDF 4.90), а
+   `the` (df = 4 915) навіть з tf = 423 — лише **0.15** (TF-IDF 0.44). Запит `the OR harpoon` у
+   топ-3 обох скорерів — тільки розділи «Moby Dick» із гарпуном.
+2. **Насичення tf у BM25.** Внесок `whale` у документ середньої довжини:
+
+   | tf | 1 | 2 | 3 | 5 | 10 | 19 | 20 |
+   |---|---|---|---|---|---|---|---|
+   | BM25 | 3.31 | 4.73 | 5.51 | 6.36 | 7.19 | 7.66 | **7.69** |
+   | TF-IDF | 3.31 | 5.60 | 6.95 | 8.64 | 10.93 | 13.06 | 13.23 |
+
+   20-те входження додає до BM25 лише +0.03 (друге додало +1.42); межа — `idf·(k1+1)`.
+3. **Нормалізація довжини.** `harpoon` з tf = 1 у 445-токенному розділі «Moby Dick» (гл. 131) —
+   BM25 **8.01**; у 155 095-токенному шматку каталогу «Harrods for Everything» — **0.23**.
+   TF-IDF дає обом однакові 4.90. Ці ж три властивості перевіряються тестами на фікстурі
+   (`tests/test_ranking.py`).
+
+### precision@5: TF-IDF vs BM25
+
+10 запитів, мітки релевантності визначені заздалегідь як «книжка(и), яку хоче бачити користувач»
+(`scripts/eval_lab03.py`). Неявний AND іноді дає < 5 збігів — бракуючі позиції рахуються як нерелевантні.
+
+| Запит | TF-IDF P@5 | top-5 | BM25 P@5 | top-5 |
+|---|---|---|---|---|
+| `white whale` | 1.0 | ✓✓✓✓✓ | 1.0 | ✓✓✓✓✓ |
+| `ghost of christmas past` | 0.8 | ✓✓✓✓✗ | 0.8 | ✓✓✓✓✗ |
+| `vampire blood count castle` | 0.6 | ✓✓✓✗ | 0.6 | ✓✓✓✗ |
+| `sherlock holmes` | 1.0 | ✓✓✓✓✓ | 1.0 | ✓✓✓✓✓ |
+| `elizabeth darcy pemberley` | 1.0 | ✓✓✓✓✓ | 1.0 | ✓✓✓✓✓ |
+| `natural selection species` | 1.0 | ✓✓✓✓✓ | 1.0 | ✓✓✓✓✓ |
+| `rabbit hole` | 0.4 | ✗✗✗✓✓ | 0.4 | ✗✓✗✓✗ |
+| `monster creator` | 0.6 | ✗✓✓✓✗ | 0.8 | ✗✓✓✓✓ |
+| `treasure map pirates` | 0.2 | ✓✗✗ | 0.2 | ✓✗✗ |
+| `war strategy enemy general` | 1.0 | ✓✓✓✓✓ | 1.0 | ✓✓✓✓✓ |
+| **середнє** | **0.76** | | **0.78** | |
+
+BM25 трохи краще там, де TF-IDF «тягне» довгі документи з багатьма повтореннями (`monster creator` —
+енциклопедія Nuttall і повне зібрання Шекспіра). Слабкі місця обох — короткі запити з загальними
+словами (`rabbit hole`) і жорсткий AND (`treasure map pirates` має лише 3 збіги: слова `pirates`
+у «Treasure Island» майже немає — там `buccaneers`). Це якраз мотивація для семантичного пошуку в Lab 8.
