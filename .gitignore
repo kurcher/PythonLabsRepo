@@ -15,3 +15,7 @@ data/
 *.bin
 *.log
 build/
+.coverage
+.hypothesis/
+.pytest_cache/
+dist/

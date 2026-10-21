@@ -1,5 +1,7 @@
 # findex — власна пошукова система
 
+[![CI](https://github.com/kurcher/PythonLabsRepo/actions/workflows/ci.yml/badge.svg)](https://github.com/kurcher/PythonLabsRepo/actions/workflows/ci.yml)
+
 Повнотекстовий пошук по корпусу, який будується впродовж 8 лабораторних курсу
 [Python — Build a Search Engine](https://github.com/rmalkevy/Programming-Practice-Projects/tree/main/courses/python).
 Кожна лаба позначена git-тегом `lab-01` … `lab-08`.
@@ -282,3 +284,72 @@ BM25 трохи краще там, де TF-IDF «тягне» довгі док�
 енциклопедія Nuttall і повне зібрання Шекспіра). Слабкі місця обох — короткі запити з загальними
 словами (`rabbit hole`) і жорсткий AND (`treasure map pirates` має лише 3 збіги: слова `pirates`
 у «Treasure Island» майже немає — там `buccaneers`). Це якраз мотивація для семантичного пошуку в Lab 8.
+
+---
+
+## Lab 4 — справжній інструмент: типи, тести, пакет, CLI
+
+### Встановлення
+
+```bash
+# з GitHub Release (wheel)
+uv tool install https://github.com/kurcher/PythonLabsRepo/releases/download/v0.4.0/findex-0.4.0-py3-none-any.whl
+# або з вихідного коду
+uv tool install .            # кладе `findex` у PATH
+uv build                     # dist/findex-0.4.0-py3-none-any.whl + sdist
+```
+
+### Команди
+
+```bash
+findex index data/chapters --out build/index.bin [--positions] [--limit N] [--format binary|pickle|json]
+findex search build/index.bin 'white whale NOT ship' [-k 10] [--scorer bm25|tfidf] [--json]
+findex stats build/index.bin [--top 20]
+findex -v search ...    # INFO-логи (час @timed);  -vv — DEBUG (cache_info)
+```
+
+* `typer`-застосунок (`findex/cli.py`), `[project.scripts] findex = "findex.cli:app"`; також `python -m findex`.
+* `rich`: прогрес-бар під час `index`, таблиця результатів із підсвіченими сніпетами в `search`,
+  таблиці в `stats`. Текст документів екранується (`rich.markup.escape`) *до* вставки розмітки
+  підсвітки, тож `[bold]` у книжці не зламає вивід.
+* `--json` — по одному JSON-об'єкту на рядок у **stdout** (`findex search ix.bin whale --json | jq .title`);
+  усе діагностичне (логи `RichHandler`, прогрес, помилки) — у **stderr**.
+* `logging` налаштовується один раз — у callback кореневої команди (`-v` → INFO, `-vv` → DEBUG).
+* Очікувані помилки — один рядок і ненульовий код: неіснуючий індекс → `error: index file not found: …`,
+  exit 1; синтаксична помилка запиту → `error: bad query: …`, exit 2; помилки аргументів — exit 2 (typer).
+
+### Типи
+
+`pyright --strict` (`[tool.pyright] typeCheckingMode = "strict"`, src + tests): **0 errors**, жодного
+`# type: ignore` у `src/`. `Scorer` — `typing.Protocol` (BM25/TfIdf задовольняють його структурно, без
+наслідування); генератори анотовані як `Iterator[...]`, аргументи — `Iterable[...]`; `Literal` для
+`--scorer`/`--format`/`--engine`; PEP 695 у `timed[**P, R]` і `type SetOp = ...`;
+`@contextmanager` повертає `Generator[Index]`.
+
+### Тести
+
+`uv run pytest --cov` — **61 тест**, з них **6 Hypothesis-властивостей** (`tests/test_properties.py`):
+
+1. двопоказникові `intersect/union/difference` == відповідні операції над `set` для будь-яких відсортованих списків;
+2. їхній вихід завжди відсортований і без дублікатів;
+3. кожен токен — нерухома точка: NFC-нормалізований і `tokenize(tok) == [tok]`;
+4. `tokenize(" ".join(tokenize(x))) == tokenize(x)` для довільного Unicode-тексту;
+5. `save → load` зберігає індекс для довільних корпусів × позиції так/ні × 3 формати (`@pytest.mark.slow`);
+6. дерево запиту обчислюється як алгебра множин: `a b` = A∩B, `a OR b` = A∪B, `a NOT b` = A∖B, `NOT a` = U∖A.
+
+`conftest.py` дає session-фікстури: корпус з 8 крихітних документів (`tests/fixtures/corpus/`),
+побудований з нього індекс і збережений файл індексу. Решта: токенізатор (Unicode, апострофи,
+дефіси, цифри), корпус (jsonl, gzip, битий UTF-8 → лог і пропуск), індекс, злиття, парсер (рівність
+дерев), три перевірки ранжування з Lab 3, кеш, сніпети, round-trip форматів, CLI через `typer.testing.CliRunner`
+(включно з тим, що `-vv` пише в stderr, а stdout лишається чистим JSON).
+
+**Покриття: 87 %** (branch coverage). Непокриті місця свідомо:
+`index.main`/`search.main` — старі argparse-CLI з Lab 2 (замінені `findex`, лишені для таблиць Lab 2);
+`memory.peak_rss` — гілки для конкретної ОС (на Windows не виконується Linux-гілка і навпаки);
+`__main__.py` — дві строки-обгортки.
+
+### CI і реліз
+
+`.github/workflows/ci.yml`: на кожен push/PR — `uv sync --locked` → `ruff check` → `ruff format --check`
+→ `pyright` → `pytest --cov` → `uv build` (wheel як артефакт). Реліз **v0.4.0** з wheel:
+https://github.com/kurcher/PythonLabsRepo/releases/tag/v0.4.0

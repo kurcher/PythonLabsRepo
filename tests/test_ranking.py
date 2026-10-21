@@ -6,7 +6,7 @@ from findex import store
 from findex.corpus import iter_documents
 from findex.index import Index, Posting, build_index, open_index
 from findex.query import QuerySyntaxError
-from findex.scoring import BM25, TfIdf
+from findex.scoring import BM25, Scorer, TfIdf
 from findex.search import SearchResult, search
 from findex.snippets import make_snippet
 
@@ -33,15 +33,16 @@ def test_index_protocol(index: Index):
 def test_open_index_releases_on_exception(index: Index, tmp_path: Path):
     path = tmp_path / "ix.bin"
     store.save(index, path)
+    held: Index | None = None
     with pytest.raises(RuntimeError), open_index(path) as ix:
         held = ix
         assert len(ix) > 0
         raise RuntimeError("boom")
-    assert len(held) == 0  # close() ran in the finally
+    assert held is not None and len(held) == 0  # close() ran in the finally
 
 
 @pytest.mark.parametrize("scorer", [BM25(), TfIdf()])
-def test_rare_term_outranks_common_term(index: Index, scorer):
+def test_rare_term_outranks_common_term(index: Index, scorer: Scorer):
     # "whale" is in 1 doc, "the" in most: the whale doc must come first
     results = search(index, "whale OR the", scorer, k=10, snippets=False)
     assert results[0].doc_id == 0

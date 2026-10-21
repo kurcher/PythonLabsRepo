@@ -70,7 +70,9 @@ class Phrase(Node):
         plists = [index.get(w, []) for w in self.words]
         if not all(plists):
             return frozenset()
-        candidates = frozenset.intersection(*(frozenset(p.doc_id for p in pl) for pl in plists))
+        candidates = frozenset(p.doc_id for p in plists[0])
+        for pl in plists[1:]:
+            candidates &= frozenset(p.doc_id for p in pl)
         by_doc = [{p.doc_id: p.positions for p in pl if p.doc_id in candidates} for pl in plists]
         hits: set[int] = set()
         for doc_id in candidates:
@@ -204,7 +206,7 @@ class _Parser:
             words = tuple(tokenize(tok.strip('"')))
             if not words:
                 raise QuerySyntaxError("empty phrase")
-            return Phrase(words) if len(words) > 1 else Term(words[0])
+            return Term(words[0]) if len(words) == 1 else Phrase(words)
         node = _word_node(tok)
         if node is None:  # pure punctuation: skip it, parse what follows
             return self.atom()

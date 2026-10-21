@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import html
 import unicodedata
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from findex.tokenize import WORD_RE, tokenize
@@ -18,7 +18,7 @@ class Snippet:
     highlights: tuple[tuple[int, int], ...] = ()  # (start, end) offsets into ``text``
 
     def _render(self, before: str, after: str, escape: bool) -> str:
-        esc = html.escape if escape else (lambda s: s)
+        esc: Callable[[str], str] = html.escape if escape else str
         out: list[str] = []
         last = 0
         for start, end in self.highlights:
@@ -60,6 +60,10 @@ def make_snippet(text: str, query_terms: Iterable[str], window: int = WINDOW) ->
     """
     wanted = set(query_terms)
     text = unicodedata.normalize("NFC", text)
+    # the first line is the document title, already shown above the snippet
+    _title, sep, body = text.partition("\n")
+    if sep and body.strip():
+        text = body.lstrip()
     spans = [
         (m.start(), m.end(), tok)
         for m in WORD_RE.finditer(text)
@@ -67,14 +71,15 @@ def make_snippet(text: str, query_terms: Iterable[str], window: int = WINDOW) ->
     ]
 
     if spans:
-        best_start, best = spans[0][0], 0
+        best_start, best = spans[0][0], (0, 0)
         j = 0
         for i, (start, _, _) in enumerate(spans):  # sliding window over match offsets
             while spans[j][0] < start - window:
                 j += 1
-            distinct = len({t for _, _, t in spans[j : i + 1]})
-            if distinct > best:
-                best, best_start = distinct, spans[j][0]
+            # most distinct terms first, then most matches overall
+            score = (len({t for _, _, t in spans[j : i + 1]}), i + 1 - j)
+            if score > best:
+                best, best_start = score, spans[j][0]
         lo = max(0, best_start - window // 2)
     else:
         lo = 0

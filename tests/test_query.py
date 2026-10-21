@@ -28,7 +28,7 @@ def test_lowercase_keywords_are_terms():
 
 
 @pytest.mark.parametrize("bad", ["", "a OR", "(a b", "a )", 'a "b', '""', "NOT"])
-def test_syntax_errors(bad):
+def test_syntax_errors(bad: str):
     with pytest.raises(QuerySyntaxError):
         parse(bad)
 

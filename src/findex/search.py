@@ -89,16 +89,22 @@ def difference(a: Sequence[int], b: Sequence[int]) -> list[int]:
     return out
 
 
-def _set_op(op: Callable[[set[int], set[int]], set[int]]):
-    def run(a: Sequence[int], b: Sequence[int]) -> list[int]:
-        return sorted(op(set(a), set(b)))
-
-    return run
+def set_intersect(a: Sequence[int], b: Sequence[int]) -> list[int]:
+    return sorted(set(a) & set(b))
 
 
-ENGINES: dict[Engine, tuple[Callable[..., list[int]], ...]] = {
+def set_union(a: Sequence[int], b: Sequence[int]) -> list[int]:
+    return sorted(set(a) | set(b))
+
+
+def set_difference(a: Sequence[int], b: Sequence[int]) -> list[int]:
+    return sorted(set(a) - set(b))
+
+
+type SetOp = Callable[[Sequence[int], Sequence[int]], list[int]]
+ENGINES: dict[Engine, tuple[SetOp, SetOp, SetOp]] = {
     "merge": (intersect, union, difference),
-    "set": (_set_op(set.__and__), _set_op(set.__or__), _set_op(set.__sub__)),
+    "set": (set_intersect, set_union, set_difference),
 }
 
 

@@ -10,7 +10,7 @@ import functools
 import time
 from array import array
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Generator, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
@@ -147,7 +147,7 @@ class Index(Mapping[str, list[Posting]]):
 
 
 @contextmanager
-def open_index(path: Path) -> Iterator[Index]:
+def open_index(path: Path) -> Generator[Index]:
     """``with open_index(p) as ix:`` — everything before ``yield`` is ``__enter__``,
     the ``finally`` is ``__exit__`` and runs even if the body raises."""
     from findex import store
