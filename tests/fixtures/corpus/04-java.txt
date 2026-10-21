@@ -1,0 +1,3 @@
+Java Notes
+
+Java is a language too. The JVM is not Python, but the loop is an event.

@@ -1,0 +1,3 @@
+Python Notes
+
+Python is a language. The event loop runs coroutines; asyncio has an event loop.
