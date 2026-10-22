@@ -15,7 +15,7 @@ jobs:
         with:
           enable-cache: true
       - name: Install
-        run: uv sync --locked
+        run: uv sync --locked --all-extras  # incl. the optional `semantic` extra, so pyright sees fastembed
       - name: Lint
         run: |
           uv run ruff check .
