@@ -18,10 +18,14 @@ from itertools import islice
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
+import numpy.typing as npt
+
 from findex.corpus import Document, iter_documents
 from findex.decorators import timed
 from findex.memory import peak_rss, utf8_stdout
-from findex.tokenize import tokenize
+from findex.packed import PackedPostings, pack
+from findex.tokenize import count_terms, tokenize
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,13 +63,14 @@ class Index(Mapping[str, list[Posting]]):
 
     def __init__(
         self,
-        postings: dict[str, list[Posting]] | None = None,
+        postings: Mapping[str, list[Posting]] | None = None,
         doc_lengths: dict[int, int] | None = None,
         doc_meta: dict[int, DocMeta] | None = None,
         *,
         has_positions: bool = False,
     ) -> None:
-        self.postings: dict[str, list[Posting]] = postings if postings is not None else {}
+        # a dict while building; a lazy PackedPostings after store.load
+        self.postings: Mapping[str, list[Posting]] = postings if postings is not None else {}
         self.doc_lengths: dict[int, int] = doc_lengths if doc_lengths is not None else {}
         self.doc_meta: dict[int, DocMeta] = doc_meta if doc_meta is not None else {}
         self.has_positions = has_positions
@@ -107,6 +112,19 @@ class Index(Mapping[str, list[Posting]]):
     def df(self, term: str) -> int:
         return len(self.postings.get(term, ()))
 
+    @cached_property
+    def packed(self) -> PackedPostings:
+        """The postings as one uint32 buffer with NumPy views (free after store.load)."""
+        return pack(self.postings, self.has_positions)
+
+    @cached_property
+    def doc_len_array(self) -> npt.NDArray[np.float64]:
+        """Document lengths indexed by doc_id (ids are dense 0..N-1)."""
+        out = np.zeros(max(self.doc_lengths, default=-1) + 1, dtype=np.float64)
+        for doc_id, length in self.doc_lengths.items():
+            out[doc_id] = length
+        return out
+
     def title(self, doc_id: int) -> str:
         return self.doc_meta[doc_id].title
 
@@ -130,7 +148,8 @@ class Index(Mapping[str, list[Posting]]):
     def __getstate__(self) -> dict[str, object]:
         state = self.__dict__.copy()
         state.pop("matching", None)  # an lru_cache wrapper doesn't pickle
-        state.pop("avg_doc_length", None)
+        for cached in ("avg_doc_length", "packed", "doc_len_array"):
+            state.pop(cached, None)
         return state
 
     def __setstate__(self, state: dict[str, object]) -> None:
@@ -143,7 +162,8 @@ class Index(Mapping[str, list[Posting]]):
         self.postings = {}
         self.doc_lengths = {}
         self.doc_meta = {}
-        self.__dict__.pop("avg_doc_length", None)
+        for cached in ("avg_doc_length", "packed", "doc_len_array"):
+            self.__dict__.pop(cached, None)
 
 
 @contextmanager
@@ -169,7 +189,7 @@ def title_of(doc: Document) -> str:
 def doc_terms(text: str, positions: bool) -> tuple[dict[str, list[int]] | Counter[str], int]:
     """Per-document term statistics: ``Counter`` of tf, or term -> list of positions."""
     if not positions:
-        counts = Counter(tokenize(text))
+        counts = count_terms(text)  # == Counter(tokenize(text)), loop in C (Lab 8)
         return counts, counts.total()
     where: defaultdict[str, list[int]] = defaultdict(list)
     n = -1

@@ -14,19 +14,20 @@ from __future__ import annotations
 import argparse
 import heapq
 import logging
+import re
 import time
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from operator import itemgetter
 from pathlib import Path
 from typing import Literal
 
 from findex.decorators import timed
 from findex.index import Index
 from findex.memory import peak_rss, utf8_stdout
-from findex.query import parse
-from findex.scoring import BM25, SCORERS, Scorer
+from findex.query import QuerySyntaxError, parse
+from findex.scoring import BM25, SCORERS, Scorer, VectorScorer
+from findex.semantic import SemanticIndex, rrf
 from findex.snippets import Snippet, make_snippet
 from findex.tokenize import tokenize
 
@@ -147,6 +148,44 @@ class SearchResult:
     snippet: Snippet | None = field(default=None, compare=False)
 
 
+Engine2 = Literal["numpy", "python"]
+
+
+def _top_python(
+    index: Index, terms: list[str], matched: frozenset[int], scorer: Scorer, n: int
+) -> list[tuple[int, float]]:
+    """Lab 3: a dict accumulator and one scorer call per posting."""
+    scores: defaultdict[int, float] = defaultdict(float)
+    for term in terms:
+        for posting in index.get(term, ()):
+            if posting.doc_id in matched:
+                scores[posting.doc_id] += scorer(term, posting, index)
+    for doc_id in matched:  # matched only through OR/NOT branches with no scored term
+        scores.setdefault(doc_id, 0.0)
+    # ties broken by doc_id so both engines produce the same order
+    return heapq.nlargest(n, scores.items(), key=lambda kv: (kv[1], -kv[0]))
+
+
+def _top_numpy(
+    index: Index, terms: list[str], matched: frozenset[int], scorer: VectorScorer, n: int
+) -> list[tuple[int, float]]:
+    """Lab 8: a dense score array, one vector expression per term, argpartition top-n."""
+    import numpy as np
+
+    scores = np.zeros(len(index.doc_len_array), dtype=np.float64)
+    for term in terms:
+        if term in index:
+            ids, weights = scorer.vector(term, index)
+            scores[ids] += weights  # ids are unique within one postings list
+    cand = np.fromiter(matched, dtype=np.int64, count=len(matched))
+    cand_scores = scores[cand]
+    if len(cand) > n:  # O(len) selection instead of an O(len log len) sort
+        part = np.argpartition(-cand_scores, n - 1)[:n]
+        cand, cand_scores = cand[part], cand_scores[part]
+    order = np.lexsort((cand, -cand_scores))  # by score desc, then doc_id asc
+    return [(int(d), float(s)) for d, s in zip(cand[order], cand_scores[order], strict=True)]
+
+
 @timed
 def search(
     index: Index,
@@ -156,26 +195,26 @@ def search(
     *,
     offset: int = 0,
     snippets: bool = True,
+    engine: Engine2 = "numpy",
 ) -> list[SearchResult]:
     """Ranked search: the query tree picks the matching set, ``scorer`` orders it.
 
-    Scores accumulate per document over the postings of the query's positive terms,
-    then the top ``k`` come out of ``heapq.nlargest`` in O(n log k).
+    ``engine="numpy"`` (default) scores whole postings lists as arrays when the scorer
+    supports it; ``engine="python"`` is the Lab 3 per-posting loop. Rankings are
+    identical (tested).
     """
     scorer = scorer or BM25()
     node = parse(query)
     matched = index.matching(query)  # lru_cache'd: a repeated query skips parse+evaluate
     log.debug("matching cache: %s", index.matching.cache_info())
-    scores: defaultdict[int, float] = defaultdict(float)
     terms = list(dict.fromkeys(node.terms()))  # dedupe, keep order
-    for term in terms:
-        for posting in index.get(term, ()):
-            if posting.doc_id in matched:
-                scores[posting.doc_id] += scorer(term, posting, index)
-    for doc_id in matched:  # matched only through OR/NOT branches with no scored term
-        scores.setdefault(doc_id, 0.0)
-    # page n needs the top offset+k; O(n log(offset+k)) is still far below a full sort
-    top = heapq.nlargest(offset + k, scores.items(), key=itemgetter(1))[offset:]
+    n = offset + k  # page n needs the top offset+k
+    if not matched:
+        top: list[tuple[int, float]] = []
+    elif engine == "numpy" and isinstance(scorer, VectorScorer):
+        top = _top_numpy(index, terms, matched, scorer, n)
+    else:
+        top = _top_python(index, terms, matched, scorer, n)
     return [
         SearchResult(
             score,
@@ -183,8 +222,72 @@ def search(
             index.title(doc_id),
             make_snippet(index.text(doc_id), terms) if snippets else None,
         )
-        for doc_id, score in top
+        for doc_id, score in top[offset:]
     ]
+
+
+Mode = Literal["keyword", "semantic", "hybrid"]
+POOL = 100  # semantic/hybrid rank the best POOL documents; pages come from that pool
+_OPERATORS = re.compile(r'\b(?:AND|OR|NOT)\b|["()]')
+
+
+def _semantic_snippet(index: Index, doc_id: int, chunk_pos: int, terms: list[str]) -> Snippet:
+    from findex.semantic import chunk_text
+
+    chunks = chunk_text(index.text(doc_id))
+    piece = chunks[chunk_pos] if chunk_pos < len(chunks) else index.text(doc_id)
+    first_line = index.text(doc_id).partition("\n")[0].strip()
+    body = piece.removeprefix(f"{first_line}. ")  # every chunk carries "<title>. " in front
+    # leading newline: make_snippet treats the first line as a title and skips it
+    return make_snippet("\n" + (body or piece), terms)
+
+
+def search_mode(
+    index: Index,
+    query: str,
+    mode: Mode = "keyword",
+    scorer: Scorer | None = None,
+    k: int = 10,
+    *,
+    offset: int = 0,
+    semantic: SemanticIndex | None = None,
+) -> tuple[int, list[SearchResult]]:
+    """``(total, page of results)`` for keyword (BM25/TF-IDF), semantic or hybrid search.
+
+    Hybrid = Reciprocal Rank Fusion of the keyword top-``POOL`` and the semantic
+    top-``POOL``: it uses ranks only, so the two incomparable score scales never mix.
+    """
+    if mode == "keyword":
+        return len(index.matching(query)), search(index, query, scorer, k, offset=offset)
+    if semantic is None:
+        from findex.semantic import SemanticUnavailable
+
+        raise SemanticUnavailable("no embeddings loaded for this index (run `findex embed`)")
+    text = " ".join(_OPERATORS.sub(" ", query).split()) or query
+    # highlight only informative words: "by"/"an" in a semantic snippet is noise
+    terms = [t for t in dict.fromkeys(tokenize(text)) if index.df(t) < 0.3 * index.num_docs]
+    sem = semantic.search(text, POOL)
+    best_chunk = {doc_id: pos for doc_id, _, pos in sem}
+    if mode == "semantic":
+        page = sem[offset : offset + k]
+        return len(sem), [
+            SearchResult(score, d, index.title(d), _semantic_snippet(index, d, pos, terms))
+            for d, score, pos in page
+        ]
+    try:
+        keyword = search(index, query, scorer, POOL, snippets=False)
+    except QuerySyntaxError:
+        keyword = []  # an unparsable query can still be answered semantically
+    fused = rrf([[r.doc_id for r in keyword], [d for d, _, _ in sem]])
+    in_keyword = {r.doc_id for r in keyword}
+    results: list[SearchResult] = []
+    for doc_id, score in fused[offset : offset + k]:
+        if doc_id in in_keyword:  # the words are in there: a keyword snippet highlights them
+            snip = make_snippet(index.text(doc_id), terms)
+        else:
+            snip = _semantic_snippet(index, doc_id, best_chunk.get(doc_id, 0), terms)
+        results.append(SearchResult(score, doc_id, index.title(doc_id), snip))
+    return len(fused), results
 
 
 def main(argv: list[str] | None = None) -> None:

@@ -153,7 +153,7 @@ def io_bench(args: argparse.Namespace) -> None:
         for p in pages
     ]
     urls = urls[: args.urls]
-    ua = {"User-Agent": "findex-course-project/0.5 (+mailto:kurch2950@gmail.com)"}
+    ua = {"User-Agent": "findex-course-project/0.5 (+https://github.com/kurcher/PythonLabsRepo)"}
 
     def get(url: str) -> int:
         try:

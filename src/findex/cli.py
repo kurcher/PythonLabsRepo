@@ -32,7 +32,6 @@ from findex.memory import utf8_stdout
 from findex.parallel import ExecutorName, build_parallel, corpus_paths
 from findex.query import QuerySyntaxError
 from findex.scoring import SCORERS
-from findex.search import search as run_search
 
 log = logging.getLogger("findex")
 app = typer.Typer(help="findex - full-text search over your own corpus.", no_args_is_help=True)
@@ -40,6 +39,7 @@ out = Console()
 err = Console(stderr=True)
 
 ScorerName = Literal["bm25", "tfidf"]
+SearchMode = Literal["keyword", "semantic", "hybrid"]
 DEFAULT_WORKERS = min(8, os.cpu_count() or 1)
 
 
@@ -79,9 +79,14 @@ def _progress() -> Progress:
 def _with_progress(docs: Iterator[Document], total: int | None) -> Iterator[Document]:
     with _progress() as progress:
         task = progress.add_task("docs", total=total)
+        pending = 0
         for doc in docs:
             yield doc
-            progress.advance(task)
+            pending += 1
+            if pending == 64:  # advance() takes a lock and re-renders: batch it (Lab 8, 15 %)
+                progress.advance(task, pending)
+                pending = 0
+        progress.advance(task, pending)
 
 
 def _load(path: Path) -> Index:
@@ -138,15 +143,27 @@ def search(
     k: Annotated[int, typer.Option("--k", "-k", min=1, max=1000)] = 10,
     scorer: Annotated[ScorerName, typer.Option()] = "bm25",
     as_json: Annotated[bool, typer.Option("--json", help="JSON lines on stdout")] = False,
+    mode: Annotated[
+        SearchMode, typer.Option(help="keyword (BM25/TF-IDF), semantic, or hybrid (RRF)")
+    ] = "keyword",
 ) -> None:
     """Ranked search with highlighted snippets."""
+    from findex.search import search_mode
+    from findex.semantic import SemanticIndex, SemanticUnavailable, embeddings_dir
+
     ix = _load(index_path)
+    semantic = None
     t0 = time.perf_counter()
     try:
-        results = run_search(ix, query, SCORERS[scorer], k)
+        if mode != "keyword":
+            semantic = SemanticIndex.load(embeddings_dir(index_path))
+        _, results = search_mode(ix, query, mode, SCORERS[scorer], k, semantic=semantic)
     except QuerySyntaxError as exc:
         raise _fail(f"bad query: {exc}", code=2) from exc
+    except SemanticUnavailable as exc:
+        raise _fail(str(exc)) from exc
     took = (time.perf_counter() - t0) * 1000
+    label = scorer if mode == "keyword" else mode
 
     if as_json:
         for r in results:
@@ -159,7 +176,7 @@ def search(
             sys.stdout.write(json.dumps(record, ensure_ascii=False) + "\n")
         return
 
-    table = Table(title=f"{query!r} — {len(results)} results, {took:.1f} ms ({scorer})")
+    table = Table(title=f"{query!r} — {len(results)} results, {took:.1f} ms ({label})")
     table.add_column("#", justify="right", style="dim")
     table.add_column("score", justify="right")
     table.add_column("document", overflow="fold")
@@ -311,3 +328,40 @@ def serve(
         reload=reload,
         log_level="info",
     )
+
+
+@app.command()
+def embed(
+    index_path: Annotated[Path, typer.Argument(metavar="INDEX")],
+    model: Annotated[str, typer.Option(help="sentence-transformers model")] = "all-MiniLM-L6-v2",
+    max_chunks: Annotated[
+        int | None, typer.Option(min=1, help="chunks per document, evenly spaced (default: all)")
+    ] = None,
+    out_dir: Annotated[Path | None, typer.Option("--out", help="default: INDEX.emb/")] = None,
+) -> None:
+    """Embed every document for semantic / hybrid search (needs the `semantic` extra)."""
+    from findex.semantic import SemanticUnavailable, embed_index, embeddings_dir
+
+    ix = _load(index_path)
+    target = out_dir or embeddings_dir(index_path)
+    estimate = ix.num_docs * (max_chunks or 18)
+    with Progress(
+        TextColumn("[bold]embedding"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=err,
+        transient=True,
+    ) as progress:
+        task = progress.add_task("chunks", total=estimate)
+        try:
+            n = embed_index(
+                ix,
+                target,
+                model=model,
+                max_chunks=max_chunks,
+                on_progress=lambda k: progress.advance(task, k),
+            )
+        except SemanticUnavailable as exc:
+            raise _fail(str(exc)) from exc
+    err.print(f"embedded [bold]{n:,}[/] chunks of {ix.num_docs:,} docs → {target}")

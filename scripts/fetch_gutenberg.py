@@ -18,7 +18,7 @@ from pathlib import Path
 
 TOP_URL = "https://www.gutenberg.org/browse/scores/top"
 MIRROR = "https://mirror.csclub.uwaterloo.ca/gutenberg"
-UA = "findex-course-project/0.1 (student search-engine lab; +mailto:kurch2950@gmail.com)"
+UA = "findex-course-project/0.1 (student search-engine lab; +https://github.com/kurcher/PythonLabsRepo)"
 
 START = re.compile(r"\*\*\* ?START OF (THE|THIS) PROJECT GUTENBERG EBOOK[^\n]*\n", re.I)
 END = re.compile(r"\*\*\* ?END OF (THE|THIS) PROJECT GUTENBERG EBOOK", re.I)

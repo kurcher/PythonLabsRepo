@@ -24,7 +24,8 @@ from findex import store
 from findex.index import Index
 from findex.query import QuerySyntaxError
 from findex.scoring import SCORERS
-from findex.search import search
+from findex.search import search_mode
+from findex.semantic import SemanticIndex, SemanticUnavailable, embeddings_dir
 from findex.web.models import DocumentOut, Health, SearchHit, SearchResponse, StatsOut
 from findex.web.settings import Settings, get_settings
 
@@ -33,6 +34,7 @@ HERE = Path(__file__).parent
 templates = Jinja2Templates(directory=HERE / "templates")
 
 ScorerName = Literal["bm25", "tfidf"]
+SearchMode = Literal["keyword", "semantic", "hybrid"]
 
 
 class State:
@@ -40,6 +42,7 @@ class State:
 
     index: Index | None = None
     index_path: Path | None = None
+    semantic: SemanticIndex | None = None
     started: float = time.time()
 
 
@@ -63,6 +66,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         # Start anyway: /health reports 503 so the platform keeps us out of rotation.
         log.error("could not load index %s: %s", settings.index_path, exc)
         state.index = None
+    try:  # optional: semantic/hybrid modes appear only if `findex embed` was run
+        state.semantic = SemanticIndex.load(embeddings_dir(settings.index_path))
+        log.info("semantic search: %d chunks", len(state.semantic.chunk_doc))
+    except (SemanticUnavailable, OSError, ValueError) as exc:
+        log.info("semantic search off: %s", exc)
+        state.semantic = None
     state.started = time.time()
     yield
     state.index = None
@@ -89,13 +98,18 @@ SettingsDep = Annotated[Settings, Depends(get_settings)]
 # --- the search core, shared by the JSON route and the HTML page --------------------
 
 
-def run_search(index: Index, q: str, k: int, scorer: str, page: int) -> SearchResponse:
+def run_search(
+    index: Index, q: str, k: int, scorer: str, page: int, mode: SearchMode = "keyword"
+) -> SearchResponse:
     t0 = time.perf_counter()
     try:
-        total = len(index.matching(q))
-        results = search(index, q, SCORERS[scorer], k, offset=(page - 1) * k)
+        total, results = search_mode(
+            index, q, mode, SCORERS[scorer], k, offset=(page - 1) * k, semantic=state.semantic
+        )
     except QuerySyntaxError as exc:
         raise HTTPException(status_code=422, detail=f"bad query: {exc}") from exc
+    except SemanticUnavailable as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     hits = [
         SearchHit(
             doc_id=r.doc_id,
@@ -108,7 +122,7 @@ def run_search(index: Index, q: str, k: int, scorer: str, page: int) -> SearchRe
     ]
     return SearchResponse(
         query=q,
-        scorer=scorer,
+        scorer=scorer if mode == "keyword" else mode,
         total=total,
         page=page,
         k=k,
@@ -122,13 +136,14 @@ QParam = Annotated[str, Query(min_length=1, max_length=500, description="query, 
 KParam = Annotated[int, Query(ge=1, le=100, description="results per page")]
 PageParam = Annotated[int, Query(ge=1, le=1000)]
 ScorerParam = Annotated[ScorerName, Query()]
+ModeParam = Annotated[SearchMode, Query(description="keyword, semantic or hybrid (RRF)")]
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     app = FastAPI(
         title=settings.app_name,
-        version="0.7.0",
+        version="1.0.0",
         summary="Full-text search (BM25 / TF-IDF) over a corpus you choose.",
         lifespan=lifespan,
     )
@@ -173,9 +188,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             k: KParam = 10,
             scorer: ScorerParam = "bm25",
             page: PageParam = 1,
+            mode: ModeParam = "keyword",
         ) -> SearchResponse:
             """Ranked search, **async def**: the CPU work runs on the event loop itself."""
-            return run_search(index, q, k, scorer, page)
+            return run_search(index, q, k, scorer, page, mode)
 
     else:
 
@@ -186,9 +202,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             k: KParam = 10,
             scorer: ScorerParam = "bm25",
             page: PageParam = 1,
+            mode: ModeParam = "keyword",
         ) -> SearchResponse:
             """Ranked search, **def**: FastAPI runs it in the threadpool, the loop stays free."""
-            return run_search(index, q, k, scorer, page)
+            return run_search(index, q, k, scorer, page, mode)
 
     @app.get("/docs/{doc_id}", response_model=DocumentOut, tags=["api"])
     def get_document(index: IndexDep, doc_id: int) -> DocumentOut:
@@ -216,6 +233,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             index_file=path.name,
             index_bytes=path.stat().st_size if path.exists() else 0,
             uptime_s=round(time.time() - state.started, 1),
+            semantic_chunks=len(state.semantic.chunk_doc) if state.semantic else 0,
         )
 
     @app.get("/health", response_model=Health, tags=["ops"])
@@ -236,6 +254,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         k: KParam = 10,
         scorer: ScorerParam = "bm25",
         page: PageParam = 1,
+        mode: ModeParam = "keyword",
     ) -> HTMLResponse:
         result: SearchResponse | None = None
         error: str | None = None
@@ -243,13 +262,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             error = "The index is not loaded yet."
         elif q.strip():
             try:
-                result = run_search(index, q, k, scorer, page)
+                result = run_search(index, q, k, scorer, page, mode)
             except HTTPException as exc:
                 error = str(exc.detail)
         context = {
             "q": q,
             "k": k,
             "scorer": scorer,
+            "mode": mode,
+            "semantic": state.semantic is not None,
             "result": result,
             "error": error,
             "docs": index.num_docs if index else 0,

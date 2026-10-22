@@ -10,6 +10,13 @@
     <option value="bm25" {% if scorer == "bm25" %}selected{% endif %}>BM25</option>
     <option value="tfidf" {% if scorer == "tfidf" %}selected{% endif %}>TF-IDF</option>
   </select>
+  {% if semantic %}
+  <select name="mode" aria-label="Mode" hx-get="/" hx-target="#results" hx-include="closest form">
+    <option value="keyword" {% if mode == "keyword" %}selected{% endif %}>Keyword</option>
+    <option value="semantic" {% if mode == "semantic" %}selected{% endif %}>Semantic</option>
+    <option value="hybrid" {% if mode == "hybrid" %}selected{% endif %}>Hybrid</option>
+  </select>
+  {% endif %}
   <input type="hidden" name="k" value="{{ k }}">
   <button type="submit">Search</button>
 </form>

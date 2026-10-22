@@ -41,6 +41,7 @@ class StatsOut(BaseModel):
     index_file: str
     index_bytes: int
     uptime_s: float
+    semantic_chunks: int = 0
 
 
 class Health(BaseModel):

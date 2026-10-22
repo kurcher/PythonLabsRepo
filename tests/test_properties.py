@@ -75,3 +75,40 @@ def test_query_algebra_matches_set_algebra(texts: list[str], w1: str, w2: str):
     assert parse(f"{w1} OR {w2}").evaluate(index) == a | b
     assert parse(f"{w1} NOT {w2}").evaluate(index) == a - b
     assert parse(f"NOT {w1}").evaluate(index) == frozenset(index.doc_ids) - a
+
+
+snippet_alphabet = st.sampled_from(
+    [*list("whaleWHALEsea ship'’ʼ-_.,!\n"), "кіт", "Кіт", "п'ять", "e" + chr(769), "ß", "SS"]
+)
+snippet_terms = st.frozensets(
+    st.sampled_from(["whale", "sea", "кіт", "п'ять", "ss", "ship", "whale's"]), max_size=4
+)
+
+
+@settings(max_examples=300, deadline=None)
+@given(st.lists(snippet_alphabet, max_size=60).map("".join), snippet_terms)
+def test_fast_snippet_spans_equal_reference(text: str, terms: frozenset[str]):
+    """Lab 8: the regex fast path must find exactly what tokenizing every word finds."""
+    from findex.snippets import find_term_spans, find_term_spans_slow
+
+    text = unicodedata.normalize("NFC", text)
+    assert find_term_spans(text, terms) == find_term_spans_slow(text, terms)
+
+
+def test_fast_snippet_regressions():
+    """Counterexamples Hypothesis found while building the fast path, pinned forever."""
+    from findex.snippets import find_term_spans, find_term_spans_slow
+
+    for text, terms in [("ß", {"ss"}), ("ʼß", {"ss"}), ("whale's whale", {"whale"})]:
+        assert find_term_spans(text, frozenset(terms)) == find_term_spans_slow(
+            text, frozenset(terms)
+        )
+
+
+@given(st.text())
+def test_count_terms_equals_counter_of_tokenize(text: str):
+    from collections import Counter
+
+    from findex.tokenize import count_terms
+
+    assert count_terms(text) == Counter(tokenize(text))

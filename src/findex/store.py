@@ -20,6 +20,7 @@ from typing import Literal
 
 from findex.decorators import timed
 from findex.index import DocMeta, Index, Posting
+from findex.packed import PackedPostings, pack
 
 Format = Literal["binary", "pickle", "json"]
 FORMATS: tuple[Format, ...] = ("binary", "pickle", "json")
@@ -108,24 +109,13 @@ def _load_json(path: Path) -> Index:
 
 
 def _save_binary(index: Index, path: Path) -> None:
-    blob = array("I")
-    terms: dict[str, list[int]] = {}
-    for term, plist in index.postings.items():
-        offset = len(blob)
-        blob.extend(p.doc_id for p in plist)
-        blob.extend(p.tf for p in plist)
-        npos = 0
-        if index.has_positions:
-            for p in plist:
-                blob.extend(p.positions)
-                npos += len(p.positions)
-        terms[term] = [offset, len(plist), npos]
+    packed = pack(index.postings, index.has_positions)
     header = json.dumps(
         {
             "byteorder": sys.byteorder,
             "positions": index.has_positions,
             "docs": _docs_header(index),
-            "terms": terms,
+            "terms": packed.terms,
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -134,10 +124,12 @@ def _save_binary(index: Index, path: Path) -> None:
         fh.write(MAGIC)
         fh.write(len(header).to_bytes(8, "little"))
         fh.write(header)
-        blob.tofile(fh)
+        fh.write(packed.raw_bytes())
 
 
 def _load_binary(path: Path) -> Index:
+    """Read the header and one buffer; ``Posting`` objects are built lazily per term
+    (Lab 8: this used to build all ~5 M of them here and took 12 s)."""
     with path.open("rb") as fh:
         if fh.read(len(MAGIC)) != MAGIC:
             raise ValueError(f"{path} is not a findex binary index")
@@ -149,19 +141,6 @@ def _load_binary(path: Path) -> Index:
 
     index = Index(has_positions=header["positions"])
     _apply_docs_header(index, header["docs"])
-    postings: dict[str, list[Posting]] = {}
-    for term, (offset, count, npos) in header["terms"].items():
-        ids = blob[offset : offset + count]
-        tfs = blob[offset + count : offset + 2 * count]
-        if npos:
-            pos = blob[offset + 2 * count : offset + 2 * count + npos]
-            plist: list[Posting] = []
-            start = 0
-            for d, tf in zip(ids, tfs, strict=True):
-                plist.append(Posting(d, tf, tuple(pos[start : start + tf])))
-                start += tf
-            postings[term] = plist
-        else:
-            postings[term] = [Posting(d, tf) for d, tf in zip(ids, tfs, strict=True)]
-    index.postings = postings
+    terms = {t: (int(o), int(c), int(n)) for t, (o, c, n) in header["terms"].items()}
+    index.postings = PackedPostings(blob, terms)
     return index
